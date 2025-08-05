@@ -1,88 +1,99 @@
 import streamlit as st
-import fitz
+import fitz  # PyMuPDF
 import base64
 from io import BytesIO
-import random
-import google.generativeai as genai
+import os
+from PIL import Image
+import requests
+from groq import Groq
 
-st.set_page_config(page_title="Gemini PDF QA Chatbot", layout="wide")
-st.title("🤖 Gemini PDF QA Chatbot")
+# Set App Title and Config
+st.set_page_config(page_title="DivAI - PDF Chatbot", layout="wide")
+st.title("💬 Hello, I’m DivAI — your PDF Assistant 🤖")
+st.markdown("Glad to see you! Upload a PDF and ask me anything about it.")
 
-genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-model = genai.GenerativeModel("models/gemini-1.5-flash")
+# Load GROQ API Key
+GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+client = Groq(api_key=GROQ_API_KEY)
 
-if "pdf_text" not in st.session_state:
-    st.session_state.pdf_text = []
-if "pdf_images" not in st.session_state:
-    st.session_state.pdf_images = {}
-if "suggested_questions" not in st.session_state:
-    st.session_state.suggested_questions = []
+# Upload PDF
+uploaded_file = st.file_uploader("📄 Upload your PDF", type="pdf")
 
-with st.sidebar:
-    uploaded_pdf = st.file_uploader("📄 Upload your PDF", type="pdf")
-    if uploaded_pdf:
-        doc = fitz.open(stream=uploaded_pdf.read(), filetype="pdf")
-        texts = []
-        images = {}
+# Preview first page
+if uploaded_file:
+    with fitz.open(stream=uploaded_file.read(), filetype="pdf") as doc:
+        first_page = doc[0]
+        image = first_page.get_pixmap()
+        img_bytes = image.tobytes("png")
+        st.image(img_bytes, caption="Preview of Page 1", use_column_width=True)
 
-        for page_num in range(len(doc)):
-            page = doc.load_page(page_num)
-            text = page.get_text()
-            texts.append({"page": page_num + 1, "text": text})
+    # Reset file for reading again later
+    uploaded_file.seek(0)
 
-            img_list = page.get_images(full=True)
-            if img_list:
-                xref = img_list[0][0]
-                pix = fitz.Pixmap(doc, xref)
-                img_bytes = pix.tobytes("png")
-                img_b64 = base64.b64encode(img_bytes).decode("utf-8")
-                images[page_num + 1] = img_b64
+    # Ask Question
+    user_question = st.text_input("❓ Ask a question from this PDF")
 
-        st.session_state.pdf_text = texts
-        st.session_state.pdf_images = images
+    if user_question:
+        with st.spinner("Generating answer..."):
+            # Convert entire PDF to text
+            pdf_text = ""
+            images = []
+            page_mapping = []
 
-        st.markdown("### 📑 PDF Preview:")
-        st.text(texts[0]["text"][:400] + "..." if texts else "No text extracted.")
-        st.success(f"PDF Uploaded: {len(doc)} pages")
+            with fitz.open(stream=uploaded_file.read(), filetype="pdf") as doc:
+                for i, page in enumerate(doc):
+                    text = page.get_text()
+                    pdf_text += f"\n\n--- Page {i+1} ---\n{text}"
 
-query = st.text_input("🔎 Ask a question from the PDF")
-if query and st.session_state.pdf_text:
-    full_text = "\n\n".join([f"Page {p['page']}: {p['text']}" for p in st.session_state.pdf_text])
-    with st.spinner("Thinking with Gemini..."):
-        prompt = f"""
-        You are a helpful assistant. Use the following PDF content to answer user questions.
-        Give relevant answer with the page number if possible. If related image exists, say "Image available".
+                    for img_index, img in enumerate(page.get_images(full=True)):
+                        xref = img[0]
+                        base_image = doc.extract_image(xref)
+                        image_bytes = base_image["image"]
+                        images.append((i+1, image_bytes))
 
-        PDF Content:
-        {full_text}
+            # Call Mixtral model via Groq
+            prompt = f"""
+You are a helpful assistant answering questions based on the given PDF content.
 
-        Question: {query}
-        """
-        response = model.generate_content(prompt)
-        final_answer = response.text.strip()
-        st.markdown("### ✅ Answer:")
-        st.write(final_answer)
+PDF Content:
+{pdf_text[:12000]}  # Limit to fit context
 
-        # 🔍 Show related image if page is mentioned
-        image_shown = False
-        for page_num, img_data in st.session_state.pdf_images.items():
-            if f"page {page_num}" in final_answer.lower():
-                st.image(BytesIO(base64.b64decode(img_data)), caption=f"🖼️ Related image from Page {page_num}")
-                image_shown = True
-                break
-        if not image_shown and len(st.session_state.pdf_images) == 1:
-            only_page = list(st.session_state.pdf_images.keys())[0]
-            st.image(BytesIO(base64.b64decode(st.session_state.pdf_images[only_page])), caption="🖼️ Image from available page")
+User Question: {user_question}
 
-        st.markdown("### 🧐 People also ask:")
-        suggestions = [
-            f"What else is discussed on page {page_num}?",
-            "Can you explain this in simpler words?",
-            "Is there an example for this?",
-            "Any disadvantages?",
-        ]
-        st.session_state.suggested_questions = random.sample(suggestions, 3)
-        for sq in st.session_state.suggested_questions:
-            if st.button(sq):
-                st.query_params.update(q=sq)
-                st.rerun()
+Give:
+1. A clear, factual answer.
+2. Mention the page number if relevant.
+3. Suggest 3 related questions like 'People also ask'.
+"""
+
+            response = client.chat.completions.create(
+                model="mixtral-8x7b-32768",
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+            answer = response.choices[0].message.content
+
+            # Display answer
+            st.markdown("### 🧠 Answer:")
+            st.markdown(answer)
+
+            # Search for related image if any
+            related_img = None
+            for pg_num, img_bytes in images:
+                if str(pg_num) in answer:
+                    related_img = (pg_num, img_bytes)
+                    break
+
+            if related_img:
+                pg, img = related_img
+                st.markdown(f"📸 Found related image on **page {pg}**")
+                st.image(img, caption=f"Image from page {pg}", use_column_width=True)
+            else:
+                st.info("No related image found in PDF.")
+
+            # Feedback buttons
+            col1, col2 = st.columns(2)
+            with col1:
+                st.button("👍 Helpful", use_container_width=True)
+            with col2:
+                st.button("👎 Not useful", use_container_width=True)
